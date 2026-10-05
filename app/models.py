@@ -30,6 +30,12 @@ class BatchPublishRequest(BaseModel):
     """同批次发布请求：2～20 个不同文档。
 
     数量、重复等语义校验在路由内完成，以返回统一格式的业务错误码。
+
+    ``idempotency_key`` 可选：调用方生成的全局唯一键（建议 UUID），
+    与按请求顺序排列的 (doc_id, expected_revision) 列表绑定。
+    首次成功后持久化键与完整结果；同键同内容的重试直接回放原结果，
+    同键不同内容返回 409 冲突。不带键的请求行为与历史版本完全一致。
     """
 
     documents: list[BatchItem] = Field(default_factory=list)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)

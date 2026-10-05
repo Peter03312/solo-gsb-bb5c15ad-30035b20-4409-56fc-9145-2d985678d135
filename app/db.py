@@ -10,6 +10,10 @@
 - 批次记录（publication_batches/batch_publications）与各文档 publications
   行在同一事务内提交：任一文档校验或渲染失败即整体回滚，批次下不会留下
   任何版本记录或批次号，也就不存在被占用的版本号。
+- 批次幂等键（batch_idempotency_keys）与批次及其 publications 行在同一事务内
+  插入：只有整批成功才会占用键。重试在同一 BEGIN IMMEDIATE 事务内先查键，
+  因此并发重试被 SQLite 写锁串行化——只有第一个事务能发布，其余全部回放
+  已提交的结果（或在请求内容不同时报冲突），最多发布一次。
 """
 from __future__ import annotations
 
@@ -70,6 +74,17 @@ CREATE TABLE IF NOT EXISTS batch_publications (
     PRIMARY KEY (batch_id, position),
     UNIQUE (doc_id, version),
     FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
+);
+
+-- 批次发布幂等键：仅在整批成功的同一事务内落库。
+-- request_fingerprint 绑定按请求顺序排列的 (doc_id, expected_revision)；
+-- response_json 保存完整成功响应，重试时原样回放（不重新校验修订、不重新渲染）。
+CREATE TABLE IF NOT EXISTS batch_idempotency_keys (
+    idempotency_key     TEXT PRIMARY KEY,
+    batch_id            TEXT NOT NULL REFERENCES publication_batches(id),
+    request_fingerprint TEXT NOT NULL,
+    response_json       TEXT NOT NULL,
+    created_at          TEXT NOT NULL
 );
 """
 

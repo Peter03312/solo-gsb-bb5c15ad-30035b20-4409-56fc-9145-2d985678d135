@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from .config import Settings
 from .db import init_db, read_tx, write_tx
@@ -39,6 +40,20 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _request_fingerprint(items: list[Any]) -> str:
+    """幂等键绑定的内容指纹：按请求顺序排列的 (doc_id, expected_revision)。
+
+    列表次序是契约的一部分（批次清单按 position 固化次序），因此保留
+    原序、不做排序；指纹只含这两类输入，不含其他请求头或时间因素。
+    """
+    payload = json.dumps(
+        [[item.doc_id, item.expected_revision] for item in items],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _error(status: int, code: str, message: str, **extra: Any) -> None:
@@ -343,9 +358,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ---------------- 批次发布（整批原子） ----------------
 
     @app.post("/publication-batches", status_code=201)
-    def publish_batch(body: BatchPublishRequest) -> dict:
+    def publish_batch(body: BatchPublishRequest):
         items = body.documents
-        # 语义校验：数量与重复在进入事务前拒绝（不涉及版本号分配）
+        # 语义校验：数量与重复在进入事务前拒绝（不涉及版本号分配，也不占用键）
         if not 2 <= len(items) <= 20:
             _error(
                 400,
@@ -365,6 +380,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             seen.add(item.doc_id)
 
+        idem_key = body.idempotency_key
+        fingerprint = _request_fingerprint(items) if idem_key is not None else None
+
         batch_id = uuid.uuid4().hex
         now = _utcnow()
         written_paths: list[str] = []
@@ -372,11 +390,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 与标注修改、单份发布、其他批次发布互斥串行；
         # 任一项失败即回滚全部 INSERT，并清理已落盘文件，不留下可公开的
         # 部分版本，MAX(version)+1 也不会被失败批次推进（记录从未提交）。
+        #
+        # 携带幂等键时，键的查重/占位与批次写入在同一事务：并发的同键重试
+        # 在 BEGIN IMMEDIATE 处排队，首个事务成功提交后，后来者只读到已提交
+        # 的键并回放原结果，因此同一键最多发布一次；任何失败都随事务回滚，
+        # 键不落库，调用方可原样用原键重试。
         try:
             with write_tx(settings.db_path) as conn:
+                if idem_key is not None:
+                    existing = conn.execute(
+                        "SELECT batch_id, request_fingerprint, response_json"
+                        " FROM batch_idempotency_keys WHERE idempotency_key = ?",
+                        (idem_key,),
+                    ).fetchone()
+                    if existing is not None:
+                        if existing["request_fingerprint"] != fingerprint:
+                            # 同键不同内容：明确冲突，原批次不受影响
+                            _error(
+                                409,
+                                "idempotency_conflict",
+                                f"idempotency key '{idem_key}' was already used"
+                                " with a different document list"
+                                " (different doc IDs, order, or expected revisions);"
+                                " use a new key for a different request",
+                                idempotency_key=idem_key,
+                                existing_batch_id=existing["batch_id"],
+                            )
+                        # 同键同内容：直接回放首次成功的完整结果。
+                        # 不重新校验当前修订号、不重新渲染，即使标注随后已变化
+                        # （修订号是请求内容的一部分，回放结果保持首次发布时的值）。
+                        # 用 JSONResponse 渲染，与首次成功响应逐字节一致。
+                        return JSONResponse(
+                            json.loads(existing["response_json"]),
+                            status_code=200,
+                            headers={"Idempotency-Replayed": "true"},
+                        )
+
                 # 第一阶段：按请求顺序逐份校验（存在性 + 修订号匹配），
                 # 先定位失败项，再渲染任何成品。
-                prepared: list[tuple[Any, int, Any]] = []
+                prepared: list[tuple[Any, int, int, Any]] = []
                 for pos, item in enumerate(items):
                     doc = conn.execute(
                         "SELECT * FROM documents WHERE id = ?", (item.doc_id,)
@@ -505,8 +557,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             out["output_sha256"],
                         ),
                     )
+
+                result = {
+                    "batch_id": batch_id,
+                    "created_at": now,
+                    "count": len(result_items),
+                    "documents": result_items,  # 顺序与请求一致
+                }
+                if idem_key is not None:
+                    # 与批次记录同一事务落库：只有整批成功才占用键。
+                    # 保存的是完整成功结果，重试时逐字节回放。
+                    conn.execute(
+                        "INSERT INTO batch_idempotency_keys"
+                        " (idempotency_key, batch_id, request_fingerprint,"
+                        " response_json, created_at) VALUES (?,?,?,?,?)",
+                        (
+                            idem_key,
+                            batch_id,
+                            fingerprint,
+                            json.dumps(result, ensure_ascii=False),
+                            now,
+                        ),
+                    )
         except Exception:
-            # 事务回滚（不留下任何批次/版本记录），并清理已落盘半成品
+            # 事务回滚（不留下任何批次/版本/幂等键记录），并清理已落盘半成品
             for path in written_paths:
                 if os.path.exists(path):
                     try:
@@ -514,12 +588,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     except OSError:
                         pass
             raise
-        return {
-            "batch_id": batch_id,
-            "created_at": now,
-            "count": len(result_items),
-            "documents": result_items,  # 顺序与请求一致
-        }
+        return result
 
     @app.get("/publication-batches/{batch_id}")
     def get_publication_batch(batch_id: str) -> dict:

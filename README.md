@@ -53,7 +53,7 @@ python -m pytest tests/ -q
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
 | POST | `/documents/{doc_id}/publish` | 按当前标注发布新版本（涂实+去元数据 PNG） |
 | GET  | `/documents/{doc_id}/publications` | 发布版本列表 |
-| POST | `/publication-batches` | **同批次发布 2～20 份文档**（原子：全成功或整批失败） |
+| POST | `/publication-batches` | **同批次发布 2～20 份文档**（原子：全成功或整批失败）；请求体可选 `idempotency_key`（全局唯一幂等键） |
 | GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致） |
 | GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因 |
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG |
@@ -84,8 +84,9 @@ curl -s $BASE/publications/$DOC_ID/1          # 版本元数据 + 遮盖坐标/�
 curl -s -OJ $BASE/publications/$DOC_ID/1/image # 发布版 PNG
 ```
 
-完整可运行脚本：`examples/demo.sh`（单份流程）与 `examples/demo_batch.sh`
-（批次发布流程）；先启动服务，再执行 `bash examples/demo_batch.sh`。
+完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
+（批次发布流程）与 `examples/demo_idempotent_batch.sh`（幂等批次发布流程）；
+先启动服务，再执行 `bash examples/demo_idempotent_batch.sh`。
 
 ## 同批次发布（2～20 份，整批原子）
 
@@ -109,7 +110,8 @@ curl -sS -X POST $BASE/publication-batches \
       {"doc_id": "DOC_ID_3", "expected_revision": 0}
     ]
   }'
-```
+# 担心网络中断丢失响应？在请求体加 "idempotency_key": "<UUID>"，
+# 详见下一节「幂等批次发布」。
 
 成功 `201`：返回批次标识、创建时间，以及按**请求顺序**排列的各文档结果
 （版本、固化的标注修订号、原图/成品摘要、遮盖数量）：
@@ -148,6 +150,72 @@ curl -sS $BASE/publication-batches/7bc8e9008700469fb1c896990b34e620
 ```
 
 
+## 幂等批次发布（可选 `idempotency_key`）
+
+批量发布网络中断时，成功响应可能丢失；直接重发同一请求又可能生成第二批版本。
+为此 `POST /publication-batches` 的请求体支持一个**可选**字段 `idempotency_key`
+（长度 1～128 的字符串，建议传 UUID，由调用方保证全局唯一）。
+
+- **键与内容绑定**：键绑定按请求顺序排列的 `(doc_id, expected_revision)` 列表
+  （文档 ID、顺序、预期修订号任一不同即视为不同内容，服务端以内容指纹比对）。
+- **首次成功**：整批成功时，在同一事务内持久化键与**完整成功结果**
+  （批次标识、各文档版本、原图/成品摘要、遮盖数量、创建时间）。响应为 `201`。
+- **同键同内容重试**：直接返回原批次标识、各文档版本与摘要，响应为 `200`，
+  并带响应头 `Idempotency-Replayed: true`；响应体与首次成功**完全一致**。
+  回放**不再校验当前修订号、不重新渲染**——即使标注随后已经变化，返回的仍是
+  首次发布时固化的修订号与摘要，也不会产生任何新版本。
+- **同键不同内容**：返回 `409 idempotency_conflict`（附 `idempotency_key`、
+  `existing_batch_id`），**原批次不受任何影响**；要发布不同内容请换一把新键。
+- **失败不占用键**：任一语义校验（数量/重复）、文档存在性、修订号校验、
+  原图读取或成品落盘失败，事务整体回滚——键不落库、不产生部分版本、不占版本号，
+  调用方可修正后用**同一把原键**重试（此时仍按当前状态正常校验与发布）。
+- **并发重试**：键的查重/占位与批次写入在同一个 `BEGIN IMMEDIATE` 事务中，
+  SQLite 写锁把并发同键请求串行化：最多只有一个请求真正发布（`201`），
+  其余同内容请求全部回放（`200`），不同内容请求全部 `409`。
+- **不带键**：不传 `idempotency_key`（或为 `null`）时行为与旧版本完全一致——
+  相同请求每次都会发布新批次、新版本；单份发布、批次查询与公开读取契约均无变化。
+
+```bash
+BASE=http://localhost:8000
+KEY=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')   # 调用方生成全局唯一键
+
+# 首次：201
+curl -sS -D - -X POST $BASE/publication-batches \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"idempotency_key\": \"$KEY\",
+    \"documents\": [
+      {\"doc_id\": \"DOC_ID_1\", \"expected_revision\": 1},
+      {\"doc_id\": \"DOC_ID_2\", \"expected_revision\": 1},
+      {\"doc_id\": \"DOC_ID_3\", \"expected_revision\": 0}
+    ]
+  }"
+# HTTP/1.1 201 Created  （无 Idempotency-Replayed 头）
+
+# 网络中断后原样重发同一请求：200 + Idempotency-Replayed: true，
+# 批次标识、各文档版本与摘要与首次完全一致，不产生第二批版本
+curl -sS -D - -X POST $BASE/publication-batches \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"idempotency_key\": \"$KEY\",
+    \"documents\": [
+      {\"doc_id\": \"DOC_ID_1\", \"expected_revision\": 1},
+      {\"doc_id\": \"DOC_ID_2\", \"expected_revision\": 1},
+      {\"doc_id\": \"DOC_ID_3\", \"expected_revision\": 0}
+    ]
+  }"
+# HTTP/1.1 200 OK
+# idempotency-replayed: true
+
+# 同键但改了某份文档的预期修订号（或换文档、换顺序）：409，原批次不变
+# {"detail":{"code":"idempotency_conflict","idempotency_key":"…",
+#   "existing_batch_id":"…","message":"…"}}
+```
+
+调用方处理建议：发布时生成一把键并随请求保存；收到任何响应不确定（超时、断连、
+5xx）后，用**同一把键、同一份请求体**重试，直到得到 `201`/`200` 为止——
+`200`（回放）与 `201`（首次成功）的响应体可按同一成功结果处理。
+
 ## 错误响应
 
 统一格式：`{"detail": {"code": "...", "message": "..."}}`
@@ -165,6 +233,8 @@ curl -sS $BASE/publication-batches/7bc8e9008700469fb1c896990b34e620
 | 400 | `invalid_batch_size` | 批次文档数不在 2～20（附 `count`） |
 | 400 | `duplicate_document_in_batch` | 批次内文档 ID 重复（附 `position`/`doc_id`） |
 | 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次场景另附 `position`/`doc_id`/`supplied_revision`） |
+| 409 | `idempotency_conflict` | 同一 `idempotency_key` 对应不同的文档 ID/顺序/预期修订号（附 `idempotency_key`/`existing_batch_id`）；原批次不受影响 |
+| 422 | （请求体校验） | `idempotency_key` 长度不在 1～128 |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
 | 413 | `payload_too_large` | 超过上传大小上限 |
@@ -185,6 +255,14 @@ curl -sS $BASE/publication-batches/7bc8e9008700469fb1c896990b34e620
   回滚并清理已落盘文件——既不产生批次标识，也没有任何 `publications` 行，因此
   `MAX(version)+1` 不会被失败批次推进（不占版本号、不留部分版本）。成功批次的每份
   版本与单份发布共用 `publications` 序列；批次清单以 `position` 固化请求次序。
+- **批次幂等键**：携带 `idempotency_key` 时，键与按序排列的
+  `(doc_id, expected_revision)` 内容指纹绑定；键行（`batch_idempotency_keys`，
+  含完整成功响应 JSON）与批次及各 `publications` 行在**同一事务**插入，因此只有
+  整批成功才占用键。重试在同一 `BEGIN IMMEDIATE` 事务开头先查键：命中且指纹相同则
+  原样回放持久化结果（`200` + `Idempotency-Replayed: true`），不再校验当前修订、
+  不再渲染落盘；指纹不同返回 `409 idempotency_conflict`，已提交批次不受影响。
+  并发同键请求被写锁串行化——最多发布一次；任何校验/原图/落盘失败都随事务回滚，
+  键不入库，可用原键重试。不带键的请求不写该表，行为与旧版本完全一致。
 - **不可变性**：标注矩形按 `(doc_id, revision)` 追加存储、历史修订永不改写；
   发布版 PNG 落盘后不改动，后续标注变化不影响已发布成品（批次产物同样如此）。
 - **脱敏**：矩形区域以纯黑不可逆涂实；发布图重建为干净像素容器后另存为 PNG，
@@ -201,22 +279,30 @@ app/
   imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染
   models.py   # 请求体模型（含批次请求）
   config.py   # 环境变量配置
-tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
-tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
+tests/test_api.py    # 用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
+tests/test_batch.py  # 用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
                      #   原图不可读/写盘失败的整批回滚、版本交错、不可变性、并发
-examples/demo.sh         # 单份端到端 curl 示例
-examples/demo_batch.sh   # 批次发布端到端 curl 示例
+tests/test_idempotency.py  # 用例：幂等键回放（标注变化后仍回放）、同键冲突、
+                           #   各类失败不占键、并发同键最多发布一次、无键兼容
+examples/demo.sh                # 单份端到端 curl 示例
+examples/demo_batch.sh          # 批次发布端到端 curl 示例
+examples/demo_idempotent_batch.sh  # 幂等批次发布端到端 curl 示例（含并发重发）
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（同批次发布）
+## 本轮变动（批次发布幂等键）
 
-- 新增 `POST /publication-batches`（2～20 份不同文档、各带预期修订号，整批原子）
-  与 `GET /publication-batches/{batch_id}`（按批次标识查询，顺序与请求一致）。
-- 新增表 `publication_batches`、`batch_publications`，并在 `publications` 增加
-  可空列 `batch_id`；旧数据卷启动时自动补列（`ALTER TABLE` 轻量迁移）。
-- 新增错误码：`invalid_batch_size`、`duplicate_document_in_batch`、
-  `batch_not_found`、`original_unavailable`、`artifact_write_failed`；批次场景的
-  `document_not_found`/`stale_revision` 附 `position`、`doc_id` 等定位字段。
-- 既有单份发布、公开读取的路由、请求与响应字段均未改动，行为完全兼容；
-  批次产物与单份产物共用版本序列与公开入口，已发布版本依旧不可变。
+- `POST /publication-batches` 请求体新增**可选**字段 `idempotency_key`
+  （1～128 字符串，建议 UUID）：首次成功在同一事务内持久化键、内容指纹与完整
+  成功结果；同键同内容重试返回 `200` + 响应头 `Idempotency-Replayed: true`
+  并原样回放（不重新校验修订、不重新渲染）；同键不同内容返回
+  `409 idempotency_conflict`，原批次不受影响。
+- 新增表 `batch_idempotency_keys`（`CREATE TABLE IF NOT EXISTS`，旧数据卷
+  启动即自动可用，无需手工迁移）。
+- 新增错误码 `idempotency_conflict`（附 `idempotency_key`、`existing_batch_id`）。
+- 任一校验、原图读取或成品落盘失败都不占用键、不产生部分版本、不占版本号，
+  可用原键重试；并发同键重试在 `BEGIN IMMEDIATE` 下最多发布一次。
+- **兼容性**：不带键的请求行为与响应完全不变；既有批次、单份发布与公开读取的
+  路由、请求与响应字段均未改动；启动方式（Docker Compose / uvicorn）与配置项
+  保持可用。
+- 新增 `examples/demo_idempotent_batch.sh` 与 `tests/test_idempotency.py`。
