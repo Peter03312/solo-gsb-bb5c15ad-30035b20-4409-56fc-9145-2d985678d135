@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from .config import Settings
 from .db import init_db, read_tx, write_tx
@@ -31,6 +32,19 @@ def _utcnow() -> str:
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _batch_request_hash(items: Any) -> str:
+    """幂等键绑定的内容摘要：按请求顺序排列的 (doc_id, expected_revision)。"""
+    canonical = json.dumps(
+        [
+            {"doc_id": it.doc_id, "expected_revision": it.expected_revision}
+            for it in items
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _sha256_file(path: str) -> str:
@@ -343,27 +357,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ---------------- 批次发布（整批原子） ----------------
 
     @app.post("/publication-batches", status_code=201)
-    def publish_batch(body: BatchPublishRequest) -> dict:
+    def publish_batch(body: BatchPublishRequest) -> Any:
         items = body.documents
-        # 语义校验：数量与重复在进入事务前拒绝（不涉及版本号分配）
-        if not 2 <= len(items) <= 20:
-            _error(
-                400,
-                "invalid_batch_size",
-                f"batch must contain between 2 and 20 documents, got {len(items)}",
-                count=len(items),
-            )
-        seen: set[str] = set()
-        for pos, item in enumerate(items):
-            if item.doc_id in seen:
-                _error(
-                    400,
-                    "duplicate_document_in_batch",
-                    f"document '{item.doc_id}' appears more than once in the batch",
-                    position=pos,
-                    doc_id=item.doc_id,
-                )
-            seen.add(item.doc_id)
+        key = body.idempotency_key
+        request_hash = _batch_request_hash(items) if key is not None else None
 
         batch_id = uuid.uuid4().hex
         now = _utcnow()
@@ -372,8 +369,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 与标注修改、单份发布、其他批次发布互斥串行；
         # 任一项失败即回滚全部 INSERT，并清理已落盘文件，不留下可公开的
         # 部分版本，MAX(version)+1 也不会被失败批次推进（记录从未提交）。
+        # 幂等键的"查重 -> 发布 -> 登记"也在该事务内：并发重试被写锁串行化，
+        # 最多发布一次；任何失败回滚时键记录一并撤销，键不被占用，可原键重试。
         try:
             with write_tx(settings.db_path) as conn:
+                # 第零阶段：幂等键检查，先于一切业务校验——
+                # 相同键+相同内容的重试直接返回首次成功结果，
+                # 即使标注随后变化，也不再校验当前修订号、不重新渲染。
+                if key is not None:
+                    prior = conn.execute(
+                        "SELECT request_hash, response FROM batch_idempotency"
+                        " WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    if prior is not None:
+                        if prior["request_hash"] == request_hash:
+                            # 重放：原样返回持久化的首次成功响应（HTTP 200）
+                            return Response(
+                                content=prior["response"],
+                                media_type="application/json",
+                                status_code=200,
+                            )
+                        # 相同键+不同内容：明确冲突，原批次不受影响
+                        _error(
+                            409,
+                            "idempotency_key_conflict",
+                            f"idempotency key '{key}' was already used with"
+                            " different batch content; the original batch is"
+                            " unchanged",
+                        )
+
+                # 语义校验：数量与重复（失败即回滚，不占用幂等键、不涉及版本号）
+                if not 2 <= len(items) <= 20:
+                    _error(
+                        400,
+                        "invalid_batch_size",
+                        f"batch must contain between 2 and 20 documents,"
+                        f" got {len(items)}",
+                        count=len(items),
+                    )
+                seen: set[str] = set()
+                for pos, item in enumerate(items):
+                    if item.doc_id in seen:
+                        _error(
+                            400,
+                            "duplicate_document_in_batch",
+                            f"document '{item.doc_id}' appears more than once"
+                            " in the batch",
+                            position=pos,
+                            doc_id=item.doc_id,
+                        )
+                    seen.add(item.doc_id)
+
                 # 第一阶段：按请求顺序逐份校验（存在性 + 修订号匹配），
                 # 先定位失败项，再渲染任何成品。
                 prepared: list[tuple[Any, int, Any]] = []
@@ -505,8 +552,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             out["output_sha256"],
                         ),
                     )
+
+                response_body = {
+                    "batch_id": batch_id,
+                    "created_at": now,
+                    "count": len(result_items),
+                    "documents": result_items,  # 顺序与请求一致
+                }
+                if key is not None:
+                    # 首次成功：持久化键与完整成功结果，同事务提交
+                    conn.execute(
+                        "INSERT INTO batch_idempotency (key, request_hash, batch_id,"
+                        " response, created_at) VALUES (?,?,?,?,?)",
+                        (
+                            key,
+                            request_hash,
+                            batch_id,
+                            json.dumps(response_body, ensure_ascii=False),
+                            now,
+                        ),
+                    )
         except Exception:
-            # 事务回滚（不留下任何批次/版本记录），并清理已落盘半成品
+            # 事务回滚（不留下任何批次/版本/幂等键记录），并清理已落盘半成品
             for path in written_paths:
                 if os.path.exists(path):
                     try:
@@ -514,12 +581,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     except OSError:
                         pass
             raise
-        return {
-            "batch_id": batch_id,
-            "created_at": now,
-            "count": len(result_items),
-            "documents": result_items,  # 顺序与请求一致
-        }
+        return response_body
 
     @app.get("/publication-batches/{batch_id}")
     def get_publication_batch(batch_id: str) -> dict:

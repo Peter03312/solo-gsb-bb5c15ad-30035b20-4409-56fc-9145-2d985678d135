@@ -27,9 +27,12 @@ class BatchItem(BaseModel):
 
 
 class BatchPublishRequest(BaseModel):
-    """同批次发布请求：2～20 个不同文档。
+    """同批次发布请求：2～20 个不同文档，可携带幂等键防重发。
 
     数量、重复等语义校验在路由内完成，以返回统一格式的业务错误码。
+    idempotency_key 为可选、调用方保证全局唯一的键；键与按请求顺序排列的
+    (doc_id, expected_revision) 列表绑定。
     """
 
     documents: list[BatchItem] = Field(default_factory=list)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)

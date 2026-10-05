@@ -10,6 +10,9 @@
 - 批次记录（publication_batches/batch_publications）与各文档 publications
   行在同一事务内提交：任一文档校验或渲染失败即整体回滚，批次下不会留下
   任何版本记录或批次号，也就不存在被占用的版本号。
+- 幂等键（batch_idempotency）与首次成功批次在同一事务内落库：键的
+  检查-发布-登记被写锁串行化，并发重试最多发布一次；失败回滚时键记录
+  一并撤销，调用方可用原键重试。
 """
 from __future__ import annotations
 
@@ -70,6 +73,14 @@ CREATE TABLE IF NOT EXISTS batch_publications (
     PRIMARY KEY (batch_id, position),
     UNIQUE (doc_id, version),
     FOREIGN KEY (doc_id, version) REFERENCES publications(doc_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS batch_idempotency (
+    key          TEXT PRIMARY KEY,          -- 调用方提供的全局唯一幂等键
+    request_hash TEXT NOT NULL,             -- 有序 (doc_id, expected_revision) 列表的摘要
+    batch_id     TEXT NOT NULL REFERENCES publication_batches(id),
+    response     TEXT NOT NULL,             -- 首次成功的完整响应体（JSON，原样重放）
+    created_at   TEXT NOT NULL
 );
 """
 
